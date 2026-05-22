@@ -8,6 +8,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
+import httpx
 import openpyxl
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -33,25 +34,37 @@ SESSIONS_FILE = BASE_DIR / "sessions.json"
 try:
     CONV_DIR.mkdir(exist_ok=True)
 except OSError:
-    pass  # Vercel 等の読み取り専用環境では無視（Supabase を使用）
+    pass  # Vercel 等の読み取り専用環境
 
 OWNER_USERNAME      = os.getenv("OWNER_USERNAME", "admin")
 OWNER_PASSWORD      = os.getenv("OWNER_PASSWORD", "")
 SAFE_CHARS          = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 SESSION_EXPIRE_DAYS = 30
 
-# ─── Supabase（オプション：環境変数が設定された場合のみ有効）────────
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+# ─── Supabase REST API ────────────────────────────────────────────
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-supa = None
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
 
-if SUPABASE_URL and SUPABASE_KEY:
-    try:
-        from supabase import create_client
-        supa = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✓ Supabase に接続しました")
-    except Exception as e:
-        print(f"Supabase 接続エラー: {e} → ファイルストレージにフォールバック")
+if USE_SUPABASE:
+    print(f"✓ Supabase 接続: {SUPABASE_URL}")
+else:
+    print("ℹ ファイルストレージ使用（ローカル開発モード）")
+
+
+def _supa_headers(prefer: str = "") -> dict:
+    h = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        h["Prefer"] = prefer
+    return h
+
+
+def _rest(table: str) -> str:
+    return f"{SUPABASE_URL}/rest/v1/{table}"
 
 
 def _now_utc() -> datetime:
@@ -59,7 +72,6 @@ def _now_utc() -> datetime:
 
 
 def _parse_dt(s: str) -> datetime:
-    """ISO datetime 文字列をタイムゾーン付きで解析"""
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
@@ -102,21 +114,19 @@ def create_session() -> str:
     now = _now_utc()
     expires_at = (now + timedelta(days=SESSION_EXPIRE_DAYS)).isoformat()
 
-    if supa:
-        # 期限切れセッションを削除
-        supa.table("sessions").delete().lt("expires_at", now.isoformat()).execute()
-        supa.table("sessions").insert({
-            "token": token,
-            "expires_at": expires_at,
-        }).execute()
+    if USE_SUPABASE:
+        with httpx.Client(timeout=10) as hc:
+            hc.delete(_rest("sessions"),
+                      headers=_supa_headers(),
+                      params={"expires_at": f"lt.{now.isoformat()}"})
+            hc.post(_rest("sessions"),
+                    headers=_supa_headers("return=minimal"),
+                    json={"token": token, "expires_at": expires_at})
     else:
         sessions = _load_sessions_file()
         sessions = {k: v for k, v in sessions.items()
                     if datetime.fromisoformat(v["expires_at"]) > datetime.now()}
-        sessions[token] = {
-            "created_at": now.isoformat(),
-            "expires_at": expires_at,
-        }
+        sessions[token] = {"created_at": now.isoformat(), "expires_at": expires_at}
         _save_sessions_file(sessions)
     return token
 
@@ -124,11 +134,15 @@ def create_session() -> str:
 def validate_session(token: str) -> bool:
     if not token:
         return False
-    if supa:
-        r = supa.table("sessions").select("expires_at").eq("token", token).execute()
-        if not r.data:
-            return False
-        return _now_utc() < _parse_dt(r.data[0]["expires_at"])
+    if USE_SUPABASE:
+        with httpx.Client(timeout=10) as hc:
+            r = hc.get(_rest("sessions"),
+                       headers=_supa_headers(),
+                       params={"token": f"eq.{token}", "select": "expires_at"})
+            rows = r.json()
+            if not rows:
+                return False
+            return _now_utc() < _parse_dt(rows[0]["expires_at"])
     else:
         sessions = _load_sessions_file()
         if token not in sessions:
@@ -137,8 +151,11 @@ def validate_session(token: str) -> bool:
 
 
 def invalidate_session(token: str):
-    if supa:
-        supa.table("sessions").delete().eq("token", token).execute()
+    if USE_SUPABASE:
+        with httpx.Client(timeout=10) as hc:
+            hc.delete(_rest("sessions"),
+                      headers=_supa_headers(),
+                      params={"token": f"eq.{token}"})
     else:
         sessions = _load_sessions_file()
         if token in sessions:
@@ -149,23 +166,21 @@ def invalidate_session(token: str):
 # ─── コード管理 ────────────────────────────────────────────────────
 
 def load_codes() -> dict:
-    if supa:
-        r = supa.table("codes").select("*").execute()
-        return {
-            row["code"]: {
-                "used":       row["used"],
-                "created_at": row["created_at"],
-                "used_at":    row["used_at"],
-            }
-            for row in r.data
-        }
-    else:
-        return _load_codes_file()
+    if USE_SUPABASE:
+        with httpx.Client(timeout=10) as hc:
+            r = hc.get(_rest("codes"),
+                       headers=_supa_headers(),
+                       params={"select": "*"})
+            rows = r.json()
+            return {row["code"]: {"used":       row["used"],
+                                  "created_at": row["created_at"],
+                                  "used_at":    row["used_at"]}
+                    for row in rows}
+    return _load_codes_file()
 
 
 def auth_required() -> bool:
-    """認証が必要かどうかを判定"""
-    if supa:
+    if USE_SUPABASE:
         return bool(OWNER_PASSWORD)
     return bool(OWNER_PASSWORD) or CODES_FILE.exists()
 
@@ -382,13 +397,8 @@ def process_excel(file_bytes: bytes, filename: str) -> str:
 
 
 def get_image_media_type(content_type: str, filename: str) -> str:
-    mapping = {
-        "image/jpeg": "image/jpeg",
-        "image/jpg":  "image/jpeg",
-        "image/png":  "image/png",
-        "image/gif":  "image/gif",
-        "image/webp": "image/webp",
-    }
+    mapping = {"image/jpeg": "image/jpeg", "image/jpg": "image/jpeg",
+               "image/png": "image/png", "image/gif": "image/gif", "image/webp": "image/webp"}
     ct = content_type.lower()
     if ct in mapping:
         return mapping[ct]
@@ -415,7 +425,6 @@ async def root(request: Request):
 
 @app.post("/auth/login")
 async def auth_login(body: dict):
-    """オーナーログイン"""
     if not OWNER_PASSWORD:
         return JSONResponse(status_code=503, content={"error": "no_owner_configured"})
     username = body.get("username", "").strip()
@@ -428,7 +437,6 @@ async def auth_login(body: dict):
 
 @app.post("/auth/logout")
 async def auth_logout(body: dict):
-    """オーナーログアウト"""
     token = body.get("token", "")
     invalidate_session(token)
     return {"ok": True}
@@ -436,32 +444,31 @@ async def auth_logout(body: dict):
 
 @app.post("/auth/verify")
 async def auth_verify(body: dict):
-    """セッション or 招待コードの検証"""
-    # オーナーセッション確認
     token = body.get("token", "")
     if validate_session(token):
         return {"ok": True, "owner_mode": True}
-    # 認証不要モード
     if not auth_required():
         return {"ok": True, "owner_mode": True}
-    # 招待コード確認
     code = body.get("code", "").strip().upper()
     if not code:
         return JSONResponse(status_code=401, content={"error": "no_code"})
 
-    if supa:
-        r = supa.table("codes").select("used").eq("code", code).execute()
-        if not r.data:
-            return JSONResponse(status_code=401, content={"error": "invalid"})
-        if r.data[0]["used"]:
-            return JSONResponse(status_code=403, content={"error": "used"})
+    if USE_SUPABASE:
+        with httpx.Client(timeout=10) as hc:
+            r = hc.get(_rest("codes"),
+                       headers=_supa_headers(),
+                       params={"code": f"eq.{code}", "select": "used"})
+            rows = r.json()
+            if not rows:
+                return JSONResponse(status_code=401, content={"error": "invalid"})
+            if rows[0]["used"]:
+                return JSONResponse(status_code=403, content={"error": "used"})
     else:
         codes = _load_codes_file()
         if code not in codes:
             return JSONResponse(status_code=401, content={"error": "invalid"})
         if codes[code]["used"]:
             return JSONResponse(status_code=403, content={"error": "used"})
-
     return {"ok": True}
 
 
@@ -494,8 +501,11 @@ async def admin_generate_codes(body: dict, request: Request):
         new_codes.append(code)
         rows_to_insert.append({"code": code, "used": False, "used_at": None})
 
-    if supa:
-        supa.table("codes").insert(rows_to_insert).execute()
+    if USE_SUPABASE:
+        with httpx.Client(timeout=10) as hc:
+            hc.post(_rest("codes"),
+                    headers=_supa_headers("return=minimal"),
+                    json=rows_to_insert)
     else:
         _save_codes_file(codes)
 
@@ -509,8 +519,11 @@ async def admin_delete_code(code: str, request: Request):
         return JSONResponse(status_code=401, content={"error": "unauthorized"})
     code_upper = code.upper()
 
-    if supa:
-        supa.table("codes").delete().eq("code", code_upper).execute()
+    if USE_SUPABASE:
+        with httpx.Client(timeout=10) as hc:
+            hc.delete(_rest("codes"),
+                      headers=_supa_headers(),
+                      params={"code": f"eq.{code_upper}"})
     else:
         codes = _load_codes_file()
         if code_upper in codes:
@@ -530,21 +543,24 @@ async def chat(
     session_token: str = Form(default=""),
 ):
     is_owner = validate_session(session_token)
-    c = code.strip().upper()
+    code_str = code.strip().upper()
 
-    # ゲストのみコード認証（オーナーはスキップ）
     if not is_owner and auth_required():
-        if supa:
-            r = supa.table("codes").select("used").eq("code", c).execute()
-            if not r.data:
-                return JSONResponse(status_code=401, content={"error": "invalid_code"})
-            if r.data[0]["used"]:
-                return JSONResponse(status_code=403, content={"error": "code_used"})
+        if USE_SUPABASE:
+            with httpx.Client(timeout=10) as hc:
+                r = hc.get(_rest("codes"),
+                           headers=_supa_headers(),
+                           params={"code": f"eq.{code_str}", "select": "used"})
+                rows = r.json()
+                if not rows:
+                    return JSONResponse(status_code=401, content={"error": "invalid_code"})
+                if rows[0]["used"]:
+                    return JSONResponse(status_code=403, content={"error": "code_used"})
         else:
             codes = _load_codes_file()
-            if c not in codes:
+            if code_str not in codes:
                 return JSONResponse(status_code=401, content={"error": "invalid_code"})
-            if codes[c]["used"]:
+            if codes[code_str]["used"]:
                 return JSONResponse(status_code=403, content={"error": "code_used"})
 
     msgs = json.loads(messages)
@@ -555,31 +571,16 @@ async def chat(
             file_bytes = await file.read()
             ct   = (file.content_type or "").lower()
             name = file.filename or ""
-
             if ct.startswith("image/") or name.lower().rsplit(".", 1)[-1] in ("jpg", "jpeg", "png", "gif", "webp"):
-                media_type = get_image_media_type(ct, name)
-                file_blocks.append({
-                    "type": "image",
-                    "source": {
-                        "type":       "base64",
-                        "media_type": media_type,
-                        "data":       base64.standard_b64encode(file_bytes).decode(),
-                    },
-                })
+                file_blocks.append({"type": "image", "source": {
+                    "type": "base64", "media_type": get_image_media_type(ct, name),
+                    "data": base64.standard_b64encode(file_bytes).decode()}})
             elif ct == "application/pdf" or name.lower().endswith(".pdf"):
-                file_blocks.append({
-                    "type": "document",
-                    "source": {
-                        "type":       "base64",
-                        "media_type": "application/pdf",
-                        "data":       base64.standard_b64encode(file_bytes).decode(),
-                    },
-                })
+                file_blocks.append({"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf",
+                    "data": base64.standard_b64encode(file_bytes).decode()}})
             elif "spreadsheet" in ct or "excel" in ct or name.lower().endswith((".xlsx", ".xls", ".xlsm")):
-                file_blocks.append({
-                    "type": "text",
-                    "text": process_excel(file_bytes, name),
-                })
+                file_blocks.append({"type": "text", "text": process_excel(file_bytes, name)})
 
         last = msgs[-1]
         text_content = last["content"] if isinstance(last["content"], str) else ""
@@ -597,22 +598,25 @@ async def chat(
     )
     response_text = response.content[0].text
 
-    # ゲストのみコード消費（オーナーは無制限）
     code_consumed = False
     if not is_owner and auth_required() and "<prompt>" in response_text:
-        if supa:
-            r = supa.table("codes").select("used").eq("code", c).execute()
-            if r.data and not r.data[0]["used"]:
-                supa.table("codes").update({
-                    "used":    True,
-                    "used_at": _now_utc().isoformat(),
-                }).eq("code", c).execute()
-                code_consumed = True
+        if USE_SUPABASE:
+            with httpx.Client(timeout=10) as hc:
+                r = hc.get(_rest("codes"),
+                           headers=_supa_headers(),
+                           params={"code": f"eq.{code_str}", "select": "used"})
+                rows = r.json()
+                if rows and not rows[0]["used"]:
+                    hc.patch(_rest("codes"),
+                             headers=_supa_headers("return=minimal"),
+                             params={"code": f"eq.{code_str}"},
+                             json={"used": True, "used_at": _now_utc().isoformat()})
+                    code_consumed = True
         else:
             codes = _load_codes_file()
-            if c in codes and not codes[c]["used"]:
-                codes[c]["used"]    = True
-                codes[c]["used_at"] = datetime.now().isoformat()
+            if code_str in codes and not codes[code_str]["used"]:
+                codes[code_str]["used"]    = True
+                codes[code_str]["used_at"] = datetime.now().isoformat()
                 _save_codes_file(codes)
                 code_consumed = True
 
@@ -623,53 +627,47 @@ async def chat(
 
 @app.get("/conversations")
 async def list_conversations():
-    if supa:
-        r = supa.table("conversations").select(
-            "id, title, created_at, updated_at"
-        ).order("updated_at", desc=True).execute()
-        return r.data
-    else:
-        convs = []
-        files = sorted(CONV_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
-        for f in files:
-            try:
-                data = json.loads(f.read_text(encoding="utf-8"))
-                convs.append({
-                    "id":         data["id"],
-                    "title":      data["title"],
-                    "created_at": data["created_at"],
-                    "updated_at": data["updated_at"],
-                })
-            except Exception:
-                continue
-        return convs
+    if USE_SUPABASE:
+        with httpx.Client(timeout=10) as hc:
+            r = hc.get(_rest("conversations"),
+                       headers=_supa_headers(),
+                       params={"select": "id,title,created_at,updated_at",
+                               "order": "updated_at.desc"})
+            return r.json()
+    convs = []
+    files = sorted(CONV_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+    for f in files:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            convs.append({"id": data["id"], "title": data["title"],
+                          "created_at": data["created_at"], "updated_at": data["updated_at"]})
+        except Exception:
+            continue
+    return convs
 
 
 @app.post("/conversations/save")
 async def save_conversation(body: SaveRequest):
     conv_id = body.id or str(uuid.uuid4())
-
     first_msg = next((m["content"] for m in body.messages if m["role"] == "user"), "無題の会話")
     if isinstance(first_msg, list):
         first_msg = next((b["text"] for b in first_msg if b.get("type") == "text"), "無題の会話")
     title = (first_msg[:38] + "…") if len(first_msg) > 38 else first_msg
-
     now = _now_utc().isoformat()
 
-    if supa:
-        # 既存レコードから created_at と title を維持
-        r = supa.table("conversations").select("created_at, title").eq("id", conv_id).execute()
-        created_at = r.data[0]["created_at"] if r.data else now
-        if r.data:
-            title = r.data[0]["title"]
-
-        supa.table("conversations").upsert({
-            "id":         conv_id,
-            "title":      title,
-            "messages":   body.messages,
-            "created_at": created_at,
-            "updated_at": now,
-        }).execute()
+    if USE_SUPABASE:
+        with httpx.Client(timeout=10) as hc:
+            r = hc.get(_rest("conversations"),
+                       headers=_supa_headers(),
+                       params={"id": f"eq.{conv_id}", "select": "created_at,title"})
+            existing = r.json()
+            created_at = existing[0]["created_at"] if existing else now
+            if existing:
+                title = existing[0]["title"]
+            hc.post(_rest("conversations"),
+                    headers=_supa_headers("resolution=merge-duplicates,return=minimal"),
+                    json={"id": conv_id, "title": title, "messages": body.messages,
+                          "created_at": created_at, "updated_at": now})
     else:
         existing_path = CONV_DIR / f"{conv_id}.json"
         created_at = now
@@ -680,14 +678,8 @@ async def save_conversation(body: SaveRequest):
                 title      = existing.get("title", title)
             except Exception:
                 pass
-
-        data = {
-            "id":         conv_id,
-            "title":      title,
-            "created_at": created_at,
-            "updated_at": now,
-            "messages":   body.messages,
-        }
+        data = {"id": conv_id, "title": title, "created_at": created_at,
+                "updated_at": now, "messages": body.messages}
         existing_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     return {"id": conv_id, "title": title}
@@ -695,22 +687,28 @@ async def save_conversation(body: SaveRequest):
 
 @app.get("/conversations/{conv_id}")
 async def get_conversation(conv_id: str):
-    if supa:
-        r = supa.table("conversations").select("*").eq("id", conv_id).execute()
-        if not r.data:
-            return JSONResponse(status_code=404, content={"error": "not found"})
-        return r.data[0]
-    else:
-        path = CONV_DIR / f"{conv_id}.json"
-        if not path.exists():
-            return JSONResponse(status_code=404, content={"error": "not found"})
-        return json.loads(path.read_text(encoding="utf-8"))
+    if USE_SUPABASE:
+        with httpx.Client(timeout=10) as hc:
+            r = hc.get(_rest("conversations"),
+                       headers=_supa_headers(),
+                       params={"id": f"eq.{conv_id}", "select": "*"})
+            rows = r.json()
+            if not rows:
+                return JSONResponse(status_code=404, content={"error": "not found"})
+            return rows[0]
+    path = CONV_DIR / f"{conv_id}.json"
+    if not path.exists():
+        return JSONResponse(status_code=404, content={"error": "not found"})
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @app.delete("/conversations/{conv_id}")
 async def delete_conversation(conv_id: str):
-    if supa:
-        supa.table("conversations").delete().eq("id", conv_id).execute()
+    if USE_SUPABASE:
+        with httpx.Client(timeout=10) as hc:
+            hc.delete(_rest("conversations"),
+                      headers=_supa_headers(),
+                      params={"id": f"eq.{conv_id}"})
     else:
         path = CONV_DIR / f"{conv_id}.json"
         if path.exists():
