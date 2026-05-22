@@ -1,0 +1,19 @@
+# 秘密情報（絶対にGitHubに上げない）
+.env
+
+# ローカルデータ（クラウドではSupabaseに保存）
+sessions.json
+codes.json
+conversations/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db

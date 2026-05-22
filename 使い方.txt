@@ -1,0 +1,32 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PromptoAI セットアップ手順
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【初回のみ必要な作業】
+
+1. Python をインストール（まだの場合）
+   https://www.python.org/downloads/
+   ※ インストール時に「Add Python to PATH」に必ずチェックを入れてください
+
+2. .env ファイルにAPIキーを設定
+   .env ファイルをメモ帳で開き、
+   ANTHROPIC_API_KEY= の後にAnthropicのAPIキーを貼り付けて保存
+
+   APIキーの取得：https://console.anthropic.com/ → API Keys
+
+3. ファイルのブロックを解除（Windows セキュリティの制限）
+   PromptoAI.bat を右クリック → プロパティ → 「ブロックの解除」にチェック → OK
+   PromptoAI終了.bat も同様に解除
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【毎回の起動方法】
+
+  PromptoAI.bat をダブルクリック
+  ※ 初回起動時は自動でパッケージをインストールします（数分かかる場合あり）
+
+【終了方法】
+
+  PromptoAI終了.bat をダブルクリック
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
